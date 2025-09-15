@@ -135,7 +135,15 @@ class ExpiringMessages(Plugin):
                     
                     try:
                         event_content = await self.client.get_event(room_id, event['event_id'])
-                        if event_content.timestamp < cutoff:
+                        if event_content == None:
+                            self.log.info(f"Event {event['event_id']} is empty, scrapping.")
+                            # Delete the event from our database after successful redaction
+                            await self.database.execute(
+                                "DELETE FROM events WHERE event_id = $1",
+                                event['event_id']
+                            )
+                            self.log.info(f"Event {event['event_id']} scrapped.")
+                        elif event_content.timestamp < cutoff:
                             if await self._redact_with_backoff(room_id, event['event_id']):
                                 # Delete the event from our database after successful redaction
                                 await self.database.execute(
@@ -143,6 +151,7 @@ class ExpiringMessages(Plugin):
                                     event['event_id']
                                 )
                                 self.log.info(f"Redacted event {event['event_id']} in room {room_id}")
+                                self.log.info(f"Removed event {event['event_id']} from redaction tracking database")
                             else:
                                 self.log.error(f"Failed to redact event {event['event_id']} after all retries")
                     except Exception as e:
