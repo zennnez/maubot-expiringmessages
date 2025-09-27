@@ -12,6 +12,13 @@ from mautrix.types import (MessageEvent, EventType, MessageType, StateEvent, Mem
 
 from .db import upgrade_table
 
+def normalize_text(text: str) -> str:
+    """
+    Lowercase and remove all non-alphanumeric characters for matching.
+    Example: "K.ill!" -> "kill"
+    """
+    return re.sub(r'[^a-z0-9]', '', text.lower())
+
 def parse_duration(duration_str: str) -> int:
     """
     Parse a string such as "24h", "3d", "15m", or composite durations like "1d2h" into seconds.
@@ -41,6 +48,32 @@ class ExpiringMessages(Plugin):
     _last_redaction_time: float = 0
     _min_redaction_interval: float = 0.1  # Minimum 100ms between redactions
 
+    async def get_bad_words(self) -> list[str]:
+        rows = await self.database.fetch("SELECT word FROM bad_words")
+        return [r["word"] for r in rows]
+
+    async def add_bad_word(self, word: str) -> bool:
+        try:
+            await self.database.execute(
+                "INSERT INTO bad_words (word) VALUES ($1) ON CONFLICT DO NOTHING",
+                word.lower(),
+            )
+            return True
+        except Exception as e:
+            self.log.error(f"Failed to insert bad word {word}: {e}")
+            return False
+
+    async def delete_bad_word(self, word: str) -> bool:
+        try:
+            await self.database.execute(
+                "DELETE FROM bad_words WHERE word=$1",
+                word.lower(),
+            )
+            return True
+        except Exception as e:
+            self.log.error(f"Failed to delete bad word {word}: {e}")
+            return False
+
     async def can_use_command(self, evt: MessageEvent) -> tuple[bool, str]:
         """
         Check if both the user and bot have permission to redact messages in this room.
@@ -69,11 +102,11 @@ class ExpiringMessages(Plugin):
             
             # Check if user has permission
             if user_level < redact_level:
-                return False, f"You need a power level of {redact_level} or higher to set message expiration."
+                return False, f"You need a power level of {redact_level} or higher to run this command."
             
             # Check if bot has permission
             if bot_level < redact_level:
-                return False, f"I need a power level of {redact_level} or higher to redact messages."
+                return False, f"I need a power level of {redact_level} or higher to function."
             
             return True, ""
         except Exception as e:
@@ -180,12 +213,57 @@ class ExpiringMessages(Plugin):
         # Database migrations will ensure RoomExpiration table exists.
         self._expirer_task = asyncio.create_task(self._expirer_loop())
         self._redaction_semaphore = asyncio.Semaphore(1)  # Only one redaction at a time
-        self.log.info("ExpirePlugin started!")
+
+        # ✅ Load bad words from DB
+        self.bad_words = set(await self.get_bad_words())
+        self.log.info(f"Loaded {len(self.bad_words)} bad words from database.")
+
 
     async def stop(self) -> None:
         if self._expirer_task:
             self._expirer_task.cancel()
         await super().stop()
+
+
+    @command.new("badword", help="Manage global bad words (admin only)")
+    async def badword_cmd(self, evt: MessageEvent) -> None:
+        allowed, msg = await self.can_use_command(evt)
+        await evt.respond("Usage:\n• !badword add <word>\n• !badword del <word>\n• !badword list")
+
+    @badword_cmd.subcommand("add", help="Add a bad word (admin only)")
+    @command.argument("word", "Word to add")
+    async def badword_add(self, evt: MessageEvent, word: str) -> None:
+        allowed, msg = await self.can_use_command(evt)
+        if not allowed:
+            await evt.respond(msg)
+            return
+        if await self.add_bad_word(word):
+            self.bad_words.add(word.lower())
+            await evt.respond(f"✅ Added bad word: `{word}`")
+        else:
+            await evt.respond("Failed to add bad word.")
+
+    @badword_cmd.subcommand("del", help="Delete a bad word (admin only)")
+    @command.argument("word", "Word to delete")
+    async def badword_del(self, evt: MessageEvent, word: str) -> None:
+        allowed, msg = await self.can_use_command(evt)
+        if not allowed:
+            await evt.respond(msg)
+            return
+        if await self.delete_bad_word(word):
+            self.bad_words.discard(word.lower())
+            await evt.respond(f"🗑️ Deleted bad word: `{word}`")
+        else:
+            await evt.respond("Failed to delete bad word.")
+
+    @badword_cmd.subcommand("list", help="List all bad words")
+    async def badword_list(self, evt: MessageEvent) -> None:
+        allowed, msg = await self.can_use_command(evt)
+        words = sorted(self.bad_words)
+        if words:
+            await evt.respond("🚫 **Bad words:**\n" + ", ".join(words))
+        else:
+            await evt.respond("No bad words set.")
 
     @command.new("expire", help="Configure message expiration for rooms")
     async def cmd_expire(self, evt: MessageEvent) -> None:
@@ -318,23 +396,47 @@ class ExpiringMessages(Plugin):
 
     @event.on(EventType.ROOM_MESSAGE)
     async def track_expiring_message(self, evt: MessageEvent) -> None:
-        if evt.content.msgtype in {MessageType.TEXT, MessageType.NOTICE, MessageType.EMOTE, 
-                                   MessageType.FILE, MessageType.IMAGE, MessageType.VIDEO,
-                                   MessageType.LOCATION}:
-            try:
-                room_rules = await self.database.fetch("SELECT room_id, expiry_msec FROM room_expiry_times")
-                
-                # Check if this room has an expiration rule
-                room_rule = next((rule for rule in room_rules if rule['room_id'] == evt.room_id), None)
-                if room_rule:
-                    query = """
-                        INSERT INTO events(event_id, room_id)
-                        VALUES ($1, $2)
-                    """
-                    await self.database.execute(query, evt.event_id, evt.room_id)
-            except Exception as e:
-                self.log.error(f"Database error in track_expiring_message: {e}")
-                # Don't respond to the user since this is an event handler
+        if evt.content.msgtype not in {
+            MessageType.TEXT,
+            MessageType.NOTICE,
+            MessageType.EMOTE,
+            MessageType.FILE,
+            MessageType.IMAGE,
+            MessageType.VIDEO,
+            MessageType.LOCATION,
+        }:
+            return
+
+        # --- Word filter ---
+        body = getattr(evt.content, "body", "") or ""
+        normalized = normalize_text(body)
+        for bad in self.bad_words:
+            if normalize_text(bad) in normalized:
+                try:
+                    # Use your _redact_with_backoff method to safely redact
+                    success = await self._redact_with_backoff(evt.room_id, evt.event_id)
+                    if success:
+                        self.log.info(f"Deleted bad word in {evt.room_id}: {bad}")
+                    else:
+                        self.log.error(f"Failed to delete bad word in {evt.room_id}: {bad}")
+                except Exception as e:
+                    self.log.error(f"Failed to delete filtered message: {e}")
+                return
+
+        # --- Expiration tracking ---
+        try:
+            rule = await self.database.fetchrow(
+                "SELECT expiry_msec FROM room_expiry_times WHERE room_id=$1",
+                evt.room_id,
+            )
+            if rule:
+                await self.database.execute(
+                    "INSERT INTO events(event_id, room_id) VALUES ($1, $2)",
+                    evt.event_id,
+                    evt.room_id,
+                )
+        except Exception as e:
+            self.log.error(f"track_expiring_message DB error: {e}")
 
     @event.on(EventType.STICKER)
     async def track_expiring_sticker(self, evt) -> None:
